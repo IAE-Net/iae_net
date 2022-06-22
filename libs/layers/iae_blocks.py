@@ -88,7 +88,7 @@ class Encoder(nn.Module):
 
             # get kernel matrix
             kernel = self.phi(in_phi).reshape(batchsize, size_x, self.modes)
-            del x_uni
+            del x_uni, in_phi
 
             # perform matrix multiplication
             x = x.reshape(batchsize, self.width, size_x) # (-1, w, s)
@@ -97,7 +97,6 @@ class Encoder(nn.Module):
 
             # additional post processing
             x = self.ln(x.permute(0, 2, 1) + self.ff_trunk(x.permute(0, 2, 1))).permute(0, 2, 1).reshape(batchsize, self.width, self.modes)
-            in_phi2 = in_phi
 
         if self.num_d == 2:
             # perform 2 layer IAE
@@ -109,7 +108,7 @@ class Encoder(nn.Module):
 
             # get kernel matrix
             kernel = self.phi_x(in_phi).reshape(batchsize, size_x1, size_x2, self.modes)
-            del x_uni
+            del x_uni, in_phi
 
             # perform matrix multiplication
             x = x.reshape(batchsize, self.width, size_x1, size_x2).permute(0, 2, 1, 3) # (-1, s, w, s)
@@ -124,7 +123,7 @@ class Encoder(nn.Module):
 
             # get kernel matrix
             kernel = self.phi_y(in_phi2).reshape(batchsize, self.modes, size_x1, self.modes)
-            del x_uni
+            del x_uni, in_phi2
 
             # perform matrix multiplication
             x = x.permute(0, 2, 1, 3) # (-1, m, w, s)
@@ -134,7 +133,7 @@ class Encoder(nn.Module):
             # additional post processing
             x = self.ln(x.permute(0, 2, 1) + self.ff_trunk(x.permute(0, 2, 1))).permute(0, 2, 1).reshape(batchsize, self.width, self.modes, self.modes)
 
-        return x, in_phi, in_phi2
+        return x
 
 class Phi2(nn.Module):
     def __init__(self, modes, width):
@@ -181,9 +180,22 @@ class Decoder(nn.Module):
 
         if self.num_d == 1: # for 1d problems, use a 1-layer IAE
             self.phi = Phi2(self.modes, self.width)
+
+            # prepare auxiliary information for decoder
+            self.compressor = nn.Sequential(
+                nn.Linear(self.modes, 1),
+            )
         elif self.num_d == 2: # for 1d problems, use a 2-layer IAE
             self.phi_x = Phi2(self.modes, self.width)
             self.phi_y = Phi2(self.modes, self.width)
+
+            # prepare auxiliary information for decoder
+            self.compressor_x = nn.Sequential(
+                nn.Linear(self.modes, 1),
+            )
+            self.compressor_y = nn.Sequential(
+                nn.Linear(self.modes, 1),
+            )
 
         # pointwise MLP to process outputs of nonlinear integral transform
         self.ff_trunk = nn.Sequential(
@@ -196,7 +208,7 @@ class Decoder(nn.Module):
         self.ln = nn.LayerNorm(self.width)
         self.ln1 = nn.LayerNorm(self.width)
 
-    def forward(self, x, in_phi, in_phi2, size_x, size_x2=None):
+    def forward(self, x, size_x, size_x2=None):
         # get some constants
         batchsize = x.shape[0] # batch size of input
         if self.num_d == 2:
@@ -204,10 +216,14 @@ class Decoder(nn.Module):
             size_x2 = size_x2 # s size
 
         if self.num_d == 1:
-            # reduce complexity of model by reusing input for forward encoder
+            # assume uniform grid
+            # since s_z is fixed constant, we do not need to explicitly give it as input to phi1
+            x_uni = torch.tensor(np.linspace(0, 1, size_x), dtype=torch.float).to(x.device).reshape(1, size_x, 1).repeat(batchsize, 1, 1)
+            in_phi = torch.cat([self.compressor(x).permute(0, 2, 1).reshape(batchsize, 1, self.width).repeat(1, size_x, 1), x_uni], 2)
+
             # get kernel matrix
             kernel = self.phi(in_phi).reshape(batchsize, size_x, self.modes).permute(0, 2, 1)
-            del in_phi
+            del x_uni, in_phi
 
             # perform matrix multiplication
             x = x.reshape(batchsize, self.width, self.modes)
@@ -220,10 +236,14 @@ class Decoder(nn.Module):
         if self.num_d == 2:
             # perform 2 layer IAE
             ### layer 1 ###
-            # reduce complexity of model by reusing input for forward encoder
+            # assume uniform grid
+            # since s_z is fixed constant, we do not need to explicitly give it as input to phi1
+            x_uni = torch.tensor(np.linspace(0, 1, size_x1), dtype=torch.float).to(x.device).reshape(1, size_x1, 1, 1).repeat(batchsize, 1, self.modes, 1)
+            in_phi2 = torch.cat([self.compressor_x(x).permute(0, 2, 3, 1).reshape(batchsize, 1, self.modes, self.width).repeat(1, size_x1, 1, 1), x_uni], 3)
+
             # get kernel matrix
             kernel = self.phi_x(in_phi2).reshape(batchsize, size_x1, self.modes, self.modes).permute(0, 2, 3, 1)
-            del in_phi2
+            del x_uni, in_phi2
 
             # perform matrix multiplication
             x = x.reshape(batchsize, self.width, self.modes, self.modes).permute(0, 2, 1, 3)
@@ -231,10 +251,14 @@ class Decoder(nn.Module):
             del kernel
 
             ### layer 2 ###
-            # reduce complexity of model by reusing input for forward encoder
+            # assume uniform grid
+            # since s_z is fixed constant, we do not need to explicitly give it as input to phi1
+            x_uni = torch.tensor(np.linspace(0, 1, size_x2), dtype=torch.float).to(x.device).reshape(1, size_x2, 1, 1).repeat(batchsize, 1, size_x1, 1)
+            in_phi = torch.cat([self.compressor_y(x).permute(0, 2, 3, 1).reshape(batchsize, 1, size_x1, self.width).repeat(1, size_x2, 1, 1), x_uni], 3)
+
             # get kernel matrix
             kernel = self.phi_y(in_phi).reshape(batchsize, size_x2, size_x1, self.modes).permute(0, 2, 3, 1)
-            del in_phi
+            del x_uni, in_phi
 
             # perform matrix multiplication
             x = x.permute(0, 2, 1, 3)
@@ -293,7 +317,8 @@ class TokenConv(nn.Module):
         target_size = x.shape[2]
 
         # pass through encoder
-        x, in_phi, in_phi2 = self.encoder(x) # (-1, in_channels, m)
+        # x = self.encoder(x) # (-1, in_channels, m)
+        x = self.encoder(x) # (-1, in_channels, m)
 
         # pass through phi_0
         if self.num_d == 1:
@@ -302,7 +327,7 @@ class TokenConv(nn.Module):
             x = self.phi_0(x.reshape(batchsize, self.in_channels, self.modes*self.modes)).reshape(batchsize, self.out_channels, self.modes, self.modes)
 
         # pass through decoder
-        x = self.decoder(x, in_phi, in_phi2, target_size, target_size)
+        x = self.decoder(x, target_size, target_size)
 
         return x
 
@@ -361,7 +386,7 @@ class TokenFourier(nn.Module):
             x = x.permute(0, 1, 4, 2, 3).reshape(batchsize, self.in_channels*2, target_size, target_size//2+1)
 
         # pass through encoder
-        x, in_phi, in_phi2 = self.encoder(x) # (-1, 2*in_channels, m)
+        x = self.encoder(x) # (-1, 2*in_channels, m)
 
         # pass through phi_0
         if self.num_d == 1:
@@ -371,9 +396,9 @@ class TokenFourier(nn.Module):
 
         # pass through decoder
         if self.num_d == 1:
-            x = self.decoder(x, in_phi, in_phi2, target_size//2+1)
+            x = self.decoder(x, target_size//2+1)
         elif self.num_d == 2:
-            x = self.decoder(x, in_phi, in_phi2, target_size, target_size//2+1)
+            x = self.decoder(x, target_size, target_size//2+1)
 
         # handle reshaping
         if self.num_d == 1:
